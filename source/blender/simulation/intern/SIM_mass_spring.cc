@@ -1260,104 +1260,109 @@ static void cloth_record_result(ClothModifierData *clmd, ImplicitSolverResult *r
 int SIM_cloth_solve(
     Depsgraph *depsgraph, Object *ob, float frame, ClothModifierData *clmd, ListBase *effectors)
 {
-  /* Hair currently is a cloth sim in disguise ...
-   * Collision detection and volumetrics work differently then.
-   * Bad design, TODO
-   */
+  /* Get the evaluated scene and check if the simulation is for hair */
   Scene *scene = DEG_get_evaluated_scene(depsgraph);
   const bool is_hair = (clmd->hairdata != nullptr);
 
-  uint i = 0;
-  float step = 0.0f, tf = clmd->sim_parms->timescale;
   Cloth *cloth = clmd->clothObject;
-  ClothVertex *verts = cloth->verts /*, *cv*/;
-  uint mvert_num = cloth->mvert_num;
-  float dt = clmd->sim_parms->dt * clmd->sim_parms->timescale;
+  ClothVertex *verts = cloth->verts;
+  const unsigned int mvert_num = cloth->mvert_num;
   Implicit_Data *id = cloth->implicit;
 
-  /* Hydrostatic pressure gradient of the fluid inside the object is affected by acceleration. */
-  bool use_acceleration = (clmd->sim_parms->flags & CLOTH_SIMSETTINGS_FLAG_PRESSURE) &&
-                          (clmd->sim_parms->fluid_density > 0);
+  const float dt = clmd->sim_parms->dt * clmd->sim_parms->timescale;
+  const float total_time = clmd->sim_parms->timescale;
+  float current_time = 0.0f;
 
+  /* Determine if acceleration should be used based on pressure and fluid density */
+  const bool use_acceleration = (clmd->sim_parms->flags & CLOTH_SIMSETTINGS_FLAG_PRESSURE) &&
+                                (clmd->sim_parms->fluid_density > 0);
+
+  /* Clear collision debug data */
   BKE_sim_debug_data_clear_category("collision");
 
+  /* Initialize solver result if not already present */
   if (!clmd->solver_result) {
     clmd->solver_result = MEM_cnew<ClothSolverResult>("cloth solver result");
   }
   cloth_clear_result(clmd);
 
-  if (clmd->sim_parms->vgroup_mass > 0) { /* Do goal stuff. */
-    for (i = 0; i < mvert_num; i++) {
-      /* update velocities with constrained velocities from pinned verts */
+  const bool has_pinned_verts = (clmd->sim_parms->vgroup_mass > 0);
+
+  /* Update velocities for pinned vertices */
+  if (has_pinned_verts) {
+    for (unsigned int i = 0; i < mvert_num; ++i) {
       if (verts[i].flags & CLOTH_VERT_FLAG_PINNED) {
         float v[3];
         sub_v3_v3v3(v, verts[i].xconst, verts[i].xold);
-        // mul_v3_fl(v, clmd->sim_parms->stepsPerFrame);
-        /* divide by time_scale to prevent constrained velocities from being multiplied */
+        /* Adjust velocity based on time scale */
         mul_v3_fl(v, 1.0f / clmd->sim_parms->time_scale);
         SIM_mass_spring_set_velocity(id, i, v);
       }
     }
   }
 
+  /* Initialize average acceleration if not using acceleration */
   if (!use_acceleration) {
     zero_v3(cloth->average_acceleration);
   }
 
-  while (step < tf) {
+  /* Time-stepping loop */
+  while (current_time < total_time) {
     ImplicitSolverResult result;
+    const float next_time = current_time + dt;
 
-    /* setup vertex constraints for pinned vertices */
+    /* Set up constraints for pinned vertices */
     cloth_setup_constraints(clmd);
 
-    /* initialize forces to zero */
+    /* Reset forces before calculating new ones */
     SIM_mass_spring_clear_forces(id);
 
-    /* calculate forces */
-    cloth_calc_force(scene, clmd, frame, effectors, step);
+    /* Calculate forces acting on the cloth */
+    cloth_calc_force(scene, clmd, frame, effectors, current_time);
 
-    /* calculate new velocity and position */
+    /* Solve velocities */
     SIM_mass_spring_solve_velocities(id, dt, &result);
     cloth_record_result(clmd, &result, dt);
 
-    /* Calculate collision impulses. */
-    cloth_solve_collisions(depsgraph, ob, clmd, step, dt);
+    /* Handle collision impulses */
+    cloth_solve_collisions(depsgraph, ob, clmd, current_time, dt);
 
+    /* Perform hair-specific continuum step if applicable */
     if (is_hair) {
       cloth_continuum_step(clmd, dt);
     }
 
+    /* Calculate average acceleration for pressure computations */
     if (use_acceleration) {
       cloth_calc_average_acceleration(clmd, dt);
     }
 
+    /* Solve positions and apply the results */
     SIM_mass_spring_solve_positions(id, dt);
     SIM_mass_spring_apply_result(id);
 
-    /* move pinned verts to correct position */
-    for (i = 0; i < mvert_num; i++) {
-      if (clmd->sim_parms->vgroup_mass > 0) {
-        if (verts[i].flags & CLOTH_VERT_FLAG_PINNED) {
-          float x[3];
-          /* divide by time_scale to prevent pinned vertices'
-           * delta locations from being multiplied */
-          interp_v3_v3v3(
-              x, verts[i].xold, verts[i].xconst, (step + dt) / clmd->sim_parms->time_scale);
-          SIM_mass_spring_set_position(id, i, x);
-        }
+    /* Update positions for pinned vertices and store previous positions */
+    for (unsigned int i = 0; i < mvert_num; ++i) {
+      if (has_pinned_verts && (verts[i].flags & CLOTH_VERT_FLAG_PINNED)) {
+        float x[3];
+        const float interp_factor = next_time / clmd->sim_parms->time_scale;
+        /* Interpolate to find the new position */
+        interp_v3_v3v3(x, verts[i].xold, verts[i].xconst, interp_factor);
+        SIM_mass_spring_set_position(id, i, x);
       }
-
+      /* Store the current position as the previous position for the next iteration */
       SIM_mass_spring_get_motion_state(id, i, verts[i].txold, nullptr);
     }
 
-    step += dt;
+    current_time = next_time;
   }
 
-  /* copy results back to cloth data */
-  for (i = 0; i < mvert_num; i++) {
+  /* Copy the final results back to the cloth data */
+  for (unsigned int i = 0; i < mvert_num; ++i) {
     SIM_mass_spring_get_motion_state(id, i, verts[i].x, verts[i].v);
     copy_v3_v3(verts[i].txold, verts[i].x);
   }
 
   return 1;
 }
+
